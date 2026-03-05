@@ -1,0 +1,107 @@
+#!/bin/bash
+# Build Alpine 9P filesystem for JSLinux/TinyEMU
+# This creates the base Alpine rootfs with dev tools
+# Yetty-specific content is added separately in the yetty repo
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTPUT_DIR="${1:-$SCRIPT_DIR/dist}"
+TOOL_BUILD_DIR="$SCRIPT_DIR/.build"
+ROOTFS_DIR="$TOOL_BUILD_DIR/rootfs"
+
+TINYEMU_URL="https://bellard.org/tinyemu/tinyemu-2019-12-21.tar.gz"
+DOCKER_IMAGE="yetty-alpine-rootfs"
+
+echo "=============================================="
+echo "Building Alpine 9P filesystem for JSLinux"
+echo "=============================================="
+echo "Output: $OUTPUT_DIR"
+echo ""
+
+mkdir -p "$TOOL_BUILD_DIR"
+
+# Step 1: Build build_filelist tool from TinyEMU
+echo "=== Step 1: Building build_filelist tool ==="
+if [ ! -f "$TOOL_BUILD_DIR/build_filelist" ]; then
+    if [ ! -d "$TOOL_BUILD_DIR/tinyemu-2019-12-21" ]; then
+        echo "Downloading TinyEMU..."
+        curl -sL "$TINYEMU_URL" -o "$TOOL_BUILD_DIR/tinyemu.tar.gz"
+        tar xzf "$TOOL_BUILD_DIR/tinyemu.tar.gz" -C "$TOOL_BUILD_DIR"
+        rm "$TOOL_BUILD_DIR/tinyemu.tar.gz"
+    fi
+    echo "Compiling build_filelist..."
+    gcc -o "$TOOL_BUILD_DIR/build_filelist" \
+        "$TOOL_BUILD_DIR/tinyemu-2019-12-21/build_filelist.c" \
+        "$TOOL_BUILD_DIR/tinyemu-2019-12-21/fs_utils.c" \
+        "$TOOL_BUILD_DIR/tinyemu-2019-12-21/cutils.c" \
+        -I"$TOOL_BUILD_DIR/tinyemu-2019-12-21"
+else
+    echo "build_filelist already exists"
+fi
+
+# Step 2: Build Docker image and export rootfs
+echo ""
+echo "=== Step 2: Building Alpine rootfs via Docker ==="
+if [ -d "$ROOTFS_DIR" ]; then
+    chmod -R u+w "$ROOTFS_DIR" 2>/dev/null || true
+    rm -rf "$ROOTFS_DIR"
+fi
+mkdir -p "$ROOTFS_DIR"
+
+docker build -t "$DOCKER_IMAGE" "$SCRIPT_DIR"
+CONTAINER_ID=$(docker create "$DOCKER_IMAGE")
+docker export "$CONTAINER_ID" | tar x -C "$ROOTFS_DIR"
+docker rm "$CONTAINER_ID" > /dev/null
+
+# Step 3: Create minimal init system
+echo ""
+echo "=== Step 3: Creating init system ==="
+rm -f "$ROOTFS_DIR/sbin/init"
+cat > "$ROOTFS_DIR/sbin/init" << 'INITEOF'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null || true
+exec </dev/hvc0 >/dev/hvc0 2>&1
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /var
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /root
+mkdir -p /var/log /var/tmp
+hostname yetty
+export HOME=/root
+export TERM=xterm-256color
+stty sane 2>/dev/null
+echo "Terminal size at init: $(stty size)"
+cd /root
+cat /etc/motd
+while true; do
+    setsid -c /bin/bash -l </dev/hvc0 >/dev/hvc0 2>&1
+done
+INITEOF
+chmod +x "$ROOTFS_DIR/sbin/init"
+
+cat > "$ROOTFS_DIR/etc/motd" << 'EOF'
+
+Welcome to yetty Alpine Linux!
+
+This is a minimal Alpine environment for JSLinux.
+
+EOF
+
+# Create /home directory structure
+mkdir -p "$ROOTFS_DIR/home"
+mkdir -p "$ROOTFS_DIR/root"
+mkdir -p "$ROOTFS_DIR/usr/local/bin"
+
+# Step 4: Build vfsync filesystem
+echo ""
+echo "=== Step 4: Building vfsync filesystem ==="
+mkdir -p "$OUTPUT_DIR"
+rm -rf "$OUTPUT_DIR"/*
+"$TOOL_BUILD_DIR/build_filelist" -m 2000 "$ROOTFS_DIR" "$OUTPUT_DIR"
+
+echo ""
+echo "=== Done! ==="
+echo "Filesystem: $OUTPUT_DIR"
+du -sh "$OUTPUT_DIR"
